@@ -117,6 +117,7 @@
 #include "lz4.h"
 /* see also "memory routines" below */
 
+#include <inaccel/coral.h>
 
 /*-************************************
 *  Compiler Options
@@ -1348,6 +1349,274 @@ int LZ4_compress_fast_extState_fastReset(void* state, const char* src, char* dst
             return LZ4_compress_generic(ctx, src, dst, srcSize, NULL, dstCapacity, limitedOutput, tableType, noDict, noDictIssue, acceleration);
         }
     }
+}
+
+
+void clean(char** in_buff, char** out_buff, unsigned** in_size_buff, unsigned** out_size_buff, inaccel_response *responses, unsigned parallel_chunks) {
+	unsigned idx;
+	for (idx = 0; idx < parallel_chunks; idx++) {
+		if (in_buff[idx]) inaccel_free(in_buff[idx]);
+		if (out_buff[idx]) inaccel_free(out_buff[idx]);
+		if (in_size_buff[idx]) inaccel_free(in_size_buff[idx]);
+		if (out_size_buff[idx]) inaccel_free(out_size_buff[idx]);
+		if (responses[idx]) free(responses[idx]);
+	}
+
+	free(in_buff);
+	free(out_buff);
+	free(in_size_buff);
+	free(out_size_buff);
+	free(responses);
+}
+
+int LZ4_compress_inaccel(const char* source, char* dest, const int *inputSize, int *maxOutputSize, unsigned numBlocks)
+{
+	unsigned BLOCK_ALIGN = 64;
+	unsigned idx, bIdx, chunk, out_chunk, block, out_block = 0, offset = 0, inSize;
+	unsigned maxBlockSize = 0;
+	unsigned maxOutBuffSize = 0, num_chunks = 0, compressed_size;
+
+	char **in_buff, **out_buff, *out_buff_ref, *out_with_offset;
+	unsigned **in_size_buff, **out_size_buff;
+	inaccel_request req;
+	inaccel_response *responses;
+
+	unsigned *blocks_per_chunk;
+
+	unsigned max_blocks_per_chunk = 0;
+	unsigned parallel_chunks = 8;
+	unsigned max_chunk_size = 64 * 1024 * 1024, chunk_size = 0;
+
+	if (!numBlocks) return out_block;
+
+	for (bIdx = 0, block = 0; bIdx <= numBlocks; bIdx++, block++) {
+		if (bIdx == numBlocks) {
+			num_chunks++;
+			if (block > max_blocks_per_chunk) max_blocks_per_chunk = block;
+		} else {
+			if ((unsigned) inputSize[bIdx] > maxBlockSize) maxBlockSize = (unsigned) inputSize[bIdx];
+			if ((unsigned) maxOutputSize[bIdx] > maxOutBuffSize) maxOutBuffSize = maxOutputSize[bIdx];
+
+			chunk_size += inputSize[bIdx];
+			if (chunk_size > max_chunk_size) {
+				num_chunks++;
+				if (block > max_blocks_per_chunk) max_blocks_per_chunk = block;
+				block = 0;
+				chunk_size = inputSize[bIdx];
+			}
+		}
+	}
+
+	if (!num_chunks) return out_block;
+	if (num_chunks < parallel_chunks) parallel_chunks = num_chunks;
+
+	blocks_per_chunk = (unsigned *) calloc(sizeof(unsigned), num_chunks);
+	if (!blocks_per_chunk) return out_block;
+	for (bIdx = 0, idx = 0, chunk_size = 0; bIdx < numBlocks; bIdx++) {
+		chunk_size += inputSize[bIdx];
+		if (chunk_size > max_chunk_size) {
+			idx++;
+			chunk_size = inputSize[bIdx];
+		}
+
+		blocks_per_chunk[idx]++;
+	}
+
+	in_buff = (char **) malloc(parallel_chunks * sizeof(char *));
+	if (!in_buff) {
+		free(blocks_per_chunk);
+		return out_block;
+	}
+	out_buff = (char **) malloc(parallel_chunks * sizeof(char *));
+	if (!out_buff) {
+		free(in_buff);
+		free(blocks_per_chunk);
+		return out_block;
+	}
+	in_size_buff = (unsigned **) malloc(parallel_chunks * sizeof(unsigned *));
+	if (!in_size_buff) {
+		free(out_buff);
+		free(in_buff);
+		free(blocks_per_chunk);
+		return out_block;
+	}
+	out_size_buff = (unsigned **) malloc(parallel_chunks * sizeof(unsigned *));
+	if (!out_size_buff) {
+		free(in_size_buff);
+		free(out_buff);
+		free(in_buff);
+		free(blocks_per_chunk);
+		return out_block;
+	}
+	responses = (inaccel_response *) malloc(parallel_chunks * sizeof(inaccel_response));
+	if (!responses) {
+		free(out_size_buff);
+		free(in_size_buff);
+		free(out_buff);
+		free(in_buff);
+		free(blocks_per_chunk);
+		return out_block;
+	}
+
+	for (idx = 0; idx < parallel_chunks; idx++) {
+		in_buff[idx] = (char *) inaccel_alloc(max_chunk_size);
+		out_buff[idx] = (char *) inaccel_alloc(max_chunk_size);
+		in_size_buff[idx] = (unsigned int *) inaccel_alloc(max_blocks_per_chunk * sizeof(unsigned int));
+		out_size_buff[idx] = (unsigned int *) inaccel_alloc(max_blocks_per_chunk * sizeof(unsigned int));
+		responses[idx] = NULL;
+
+		if (in_buff[idx] == NULL ||
+			out_buff[idx] == NULL ||
+			in_size_buff[idx] == NULL ||
+			out_size_buff[idx] == NULL ) {
+			for (idx = 0; idx < parallel_chunks; ++idx) {
+				inaccel_free(out_size_buff[idx]);
+				inaccel_free(in_size_buff[idx]);
+				inaccel_free(out_buff[idx]);
+				inaccel_free(in_buff[idx]);
+			}
+			free(responses);
+			free(out_size_buff);
+			free(in_size_buff);
+			free(out_buff);
+			free(in_buff);
+			free(blocks_per_chunk);
+
+			return out_block;
+		}
+	}
+
+	out_buff_ref = (char *) malloc(maxOutBuffSize);
+	if (!out_buff_ref) {
+		for (idx = 0; idx < parallel_chunks; ++idx) {
+			inaccel_free(out_size_buff[idx]);
+			inaccel_free(in_size_buff[idx]);
+			inaccel_free(out_buff[idx]);
+			inaccel_free(in_buff[idx]);
+		}
+		free(responses);
+		free(out_size_buff);
+		free(in_size_buff);
+		free(out_buff);
+		free(in_buff);
+		free(blocks_per_chunk);
+
+		return out_block;
+	}
+
+	compressed_size = 0;
+	for (chunk = 0, out_chunk = 0, block = 0; chunk < num_chunks;){
+		for (idx = 0; idx < parallel_chunks; idx++, chunk++) {
+			if (chunk == num_chunks) break;
+
+			for (bIdx = 0, inSize = 0; bIdx < blocks_per_chunk[chunk]; bIdx++, block++) {
+				memcpy(in_buff[idx] + inSize, source + offset, inputSize[block]);
+				in_size_buff[idx][bIdx] = inputSize[block];
+				offset += inputSize[block];
+				inSize += (inputSize[block] + (BLOCK_ALIGN - 1)) & (~(BLOCK_ALIGN - 1));
+			}
+
+			req = inaccel_request_create("com.xilinx.vitis.dataCompression.lz4.compress");
+			if (!req) {
+				clean(in_buff, out_buff, in_size_buff, out_size_buff, responses, parallel_chunks);
+				free(out_buff_ref);
+				free(blocks_per_chunk);
+				return out_block;
+			}
+			if (inaccel_request_arg_array(req, max_chunk_size, in_buff[idx], 0)) {
+				inaccel_request_release(req);
+				clean(in_buff, out_buff, in_size_buff, out_size_buff, responses, parallel_chunks);
+				free(out_buff_ref);
+				free(blocks_per_chunk);
+				return out_block;
+			}
+			if(inaccel_request_arg_array(req, max_chunk_size, out_buff[idx], 1)) {
+				inaccel_request_release(req);
+				clean(in_buff, out_buff, in_size_buff, out_size_buff, responses, parallel_chunks);
+				free(out_buff_ref);
+				free(blocks_per_chunk);
+				return out_block;
+			}
+			if(inaccel_request_arg_array(req, max_blocks_per_chunk * sizeof(unsigned), out_size_buff[idx], 2)) {
+				inaccel_request_release(req);
+				clean(in_buff, out_buff, in_size_buff, out_size_buff, responses, parallel_chunks);
+				free(out_buff_ref);
+				free(blocks_per_chunk);
+				return out_block;
+			}
+			if(inaccel_request_arg_array(req, max_blocks_per_chunk * sizeof(unsigned), in_size_buff[idx], 3)) {
+				inaccel_request_release(req);
+				clean(in_buff, out_buff, in_size_buff, out_size_buff, responses, parallel_chunks);
+				free(out_buff_ref);
+				free(blocks_per_chunk);
+				return out_block;
+			}
+			if(inaccel_request_arg_scalar(req, sizeof(unsigned), &(blocks_per_chunk[chunk]), 4)) {
+				inaccel_request_release(req);
+				clean(in_buff, out_buff, in_size_buff, out_size_buff, responses, parallel_chunks);
+				free(out_buff_ref);
+				free(blocks_per_chunk);
+				return out_block;
+			}
+
+			responses[idx] = inaccel_response_create();
+			if (!responses[idx]) {
+				inaccel_request_release(req);
+				clean(in_buff, out_buff, in_size_buff, out_size_buff, responses, parallel_chunks);
+				free(out_buff_ref);
+				free(blocks_per_chunk);
+				return out_block;
+			}
+			inaccel_submit(req, responses[idx]);
+			inaccel_request_release(req);
+		}
+
+		for(idx = 0; idx < parallel_chunks; ++idx, out_chunk++) {
+			if (out_chunk == num_chunks) break;
+
+			if (inaccel_response_wait(responses[idx])) {
+				clean(in_buff, out_buff, in_size_buff, out_size_buff, responses, parallel_chunks);
+				free(out_buff_ref);
+				free(blocks_per_chunk);
+
+				return out_block;
+			}
+			inaccel_response_release(responses[idx]);
+			responses[idx] = NULL;
+
+			for (bIdx = 0, inSize = 0; bIdx < blocks_per_chunk[out_chunk]; bIdx++, out_block++) {
+				if (in_size_buff[idx][bIdx] != 0) {
+					/* Read compressed block size */
+					if (out_size_buff[idx][bIdx] && (out_size_buff[idx][bIdx] < in_size_buff[idx][bIdx])) {
+						out_with_offset = out_buff[idx] + inSize;
+					} else {
+						out_size_buff[idx][bIdx] = LZ4_compress_fast(in_buff[idx] + inSize, out_buff_ref, in_size_buff[idx][bIdx], maxOutBuffSize, 1);
+						out_with_offset = out_buff_ref;
+					}
+
+					if (out_size_buff[idx][bIdx] > (unsigned) maxOutputSize[out_block]) {
+						clean(in_buff, out_buff, in_size_buff, out_size_buff, responses, parallel_chunks);
+						free(out_buff_ref);
+						free(blocks_per_chunk);
+
+						return out_block;
+					}
+					maxOutputSize[out_block] = out_size_buff[idx][bIdx];
+
+					memcpy(dest + compressed_size, out_with_offset, out_size_buff[idx][bIdx]);
+					compressed_size += out_size_buff[idx][bIdx];
+
+					inSize += (inputSize[out_block] + (BLOCK_ALIGN - 1)) & (~(BLOCK_ALIGN - 1));
+				}
+			}
+		}
+	}
+
+	clean(in_buff, out_buff, in_size_buff, out_size_buff, responses, parallel_chunks);
+	free(out_buff_ref);
+	free(blocks_per_chunk);
+
+	return out_block;
 }
 
 

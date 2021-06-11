@@ -83,7 +83,7 @@ lz4: $(OBJFILES) lz4-exe.o
 	$(CC) $(FLAGS) $^ -o $@$(EXT)
 else
 lz4: $(OBJFILES)
-	$(CC) $(FLAGS) $(OBJFILES) -o $@$(EXT) $(LDLIBS)
+	$(CC) $(FLAGS) $(OBJFILES) -o $@$(EXT) $(LDLIBS) -lcoral-api
 endif
 
 .PHONY: lz4-release

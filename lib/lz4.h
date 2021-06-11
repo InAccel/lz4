@@ -181,6 +181,17 @@ LZ4LIB_API int LZ4_decompress_safe (const char* src, char* dst, int compressedSi
 */
 LZ4LIB_API int LZ4_compressBound(int inputSize);
 
+/*! LZ4_compress_inaccel() :
+    Compresses a batch of blocks using the power of FPGAs.
+    The larger the batch size, the better the speedup a user can inspect compared to the software implementation.
+    Source contains all blocks and dest after execution contains all compressed blocks.
+    inputSize holds the block size of each block
+    outputSize holds the maximum output size for each block and after excution contains the size of each compressed block.
+    numBlocks holds the number of blocks in this batch
+    Upon successful execution, the number of blocks compressed is returned or else zero (0) to indicate that an error occurred.
+*/
+LZ4LIB_API int LZ4_compress_inaccel(const char* source, char* dest, const int *inputSize, int *outputSize, unsigned numBlocks);
+
 /*! LZ4_compress_fast() :
     Same as LZ4_compress_default(), but allows selection of "acceleration" factor.
     The larger the acceleration value, the faster the algorithm, but also the lesser the compression.

@@ -62,6 +62,7 @@ static int g_lz4c_legacy_commands = 0;
 #define GB *(1U<<30)
 
 #define LZ4_BLOCKSIZEID_DEFAULT 7
+#define LZ4_CHUNKSIZEID_DEFAULT 1
 
 
 /*-************************************
@@ -161,6 +162,8 @@ static int usage_advanced(const char* exeName)
         DISPLAY( " -c2,-hc: very high compression \n");
         DISPLAY( " -y     : overwrite output without prompting \n");
     }
+    DISPLAY( " -FC#   : set chunk size to a predefined size [0-3] (default: 1) \n");
+    DISPLAY( "                     0: 32MB, 1: 64MB, 2: 128MB, 3: 256MB \n");
     return 0;
 }
 
@@ -222,6 +225,11 @@ static int usage_longhelp(const char* exeName)
         DISPLAY( "          %s -h -c filename \n", exeName);
         DISPLAY( "which displays help text and exits \n");
     }
+    DISPLAY( "Acceleration Options : \n");
+    DISPLAY( "-----------------------\n");
+    DISPLAY( "-F   => Enable Acceleration\n");
+    DISPLAY( "-FC#   : set chunk size to a predefined size [0-3] (default: 1) \n");
+    DISPLAY( "                     0: 32MB, 1: 64MB, 2: 128MB, 3: 256MB \n");
     return 0;
 }
 
@@ -329,6 +337,7 @@ int main(int argc, const char** argv)
     const char nullOutput[] = NULL_OUTPUT;
     const char extension[] = LZ4_EXTENSION;
     size_t blockSize = LZ4IO_setBlockSizeID(prefs, LZ4_BLOCKSIZEID_DEFAULT);
+    size_t chunkSize = LZ4IO_setChunkSizeID(prefs, LZ4_CHUNKSIZEID_DEFAULT);
     const char* const exeName = lastNameFromPath(argv[0]);
 #ifdef UTIL_HAS_CREATEFILELIST
     const char** extendedFileList = NULL;
@@ -476,6 +485,43 @@ int main(int argc, const char** argv)
 
                     /* Use Legacy format (ex : Linux kernel compression) */
                 case 'l': legacy_format = 1; blockSize = 8 MB; break;
+
+                case 'F':
+                    LZ4IO_setInAccel(prefs);
+                    // LZ4IO_setInAccelChunkSize(prefs, 64 MB);
+                    while (argument[1]!=0) {
+                        int exitAccelProperties=0;
+                        switch(argument[1])
+                        {
+                            case 'C':
+                                argument ++;
+                                if (argument[1] < '0' || argument[1] > '9') {
+                                    badusage(exeName);
+                                } else {
+                                    unsigned C;
+                                    argument++;
+                                    C = readU32FromChar(&argument);
+                                    argument--;
+                                    if (C > 3) badusage(exeName);
+                                    else {
+                                    // if (C <= 3) {
+                                        chunkSize = LZ4IO_setChunkSizeID(prefs, C);
+                                        DISPLAYLEVEL(2, "using chunks of size %u MB \n", (U32)(chunkSize>>20));
+                                    }
+                                    // } else {
+                                    //     if (C < 32 MB) badusage(exeName);
+                                    //     chunkSize = LZ4IO_setChunkSize(prefs, C);
+                                    //     DISPLAYLEVEL(2, "using chunks of size %u MB \n", (U32)(chunkSize>>20));
+                                    // }
+                                }
+                                break;
+                            default :
+                            exitAccelProperties=1;
+                            break;
+                        }
+                        if (exitAccelProperties) break;
+                    }
+                    break;
 
                     /* Decoding */
                 case 'd': mode = om_decompress; break;

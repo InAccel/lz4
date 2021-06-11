@@ -95,9 +95,17 @@ int LZ4IO_setTestMode(LZ4IO_prefs_t* const prefs, int yes);
    return : 0 if error, blockSize if OK */
 size_t LZ4IO_setBlockSizeID(LZ4IO_prefs_t* const prefs, unsigned blockSizeID);
 
+/* chunkSizeID : valid values : 0-1-2-3
+   return : 0 if error, chunkSize if OK */
+size_t LZ4IO_setChunkSizeID(LZ4IO_prefs_t* const prefs, unsigned chunkSizeID);
+
 /* blockSize : valid values : 32 -> 4MB
    return : 0 if error, actual blocksize if OK */
 size_t LZ4IO_setBlockSize(LZ4IO_prefs_t* const prefs, size_t blockSize);
+
+/* chunkSize : valid values : 32MB -> 256MB
+   return : 0 if error, actual blocksize if OK */
+size_t LZ4IO_setChunkSize(LZ4IO_prefs_t* const prefs, size_t chunkSize);
 
 /* Default setting : independent blocks */
 typedef enum { LZ4IO_blockLinked=0, LZ4IO_blockIndependent} LZ4IO_blockMode_t;
@@ -130,5 +138,7 @@ void LZ4IO_favorDecSpeed(LZ4IO_prefs_t* const prefs, int favor);
  * @return 0 on success, 1 on error */
 int LZ4IO_displayCompressedFilesInfo(const char** inFileNames, size_t ifnIdx);
 
+/* Default setting : 0 (disabled) */
+int LZ4IO_setInAccel(LZ4IO_prefs_t* const prefs);
 
 #endif  /* LZ4IO_H_237902873 */

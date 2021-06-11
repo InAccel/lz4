@@ -58,6 +58,7 @@
 #define LZ4F_STATIC_LINKING_ONLY
 #include "lz4frame.h"
 #include "lz4io.h"
+#include <inaccel/coral.h>
 
 
 /*****************************
@@ -125,6 +126,9 @@ struct LZ4IO_prefs_s {
     unsigned favorDecSpeed;
     const char* dictionaryFilename;
     int removeSrcFile;
+    unsigned fpgaAcceleration;
+    int chunkSizeId;
+    size_t chunkSize;
 };
 
 /**************************************
@@ -175,6 +179,9 @@ LZ4IO_prefs_t* LZ4IO_defaultPreferences(void)
     ret->favorDecSpeed = 0;
     ret->dictionaryFilename = NULL;
     ret->removeSrcFile = 0;
+    ret->fpgaAcceleration = 0;
+    ret->chunkSizeId = 1;
+    ret->chunkSize = 0;
     return ret;
 }
 
@@ -225,6 +232,18 @@ size_t LZ4IO_setBlockSizeID(LZ4IO_prefs_t* const prefs, unsigned bsid)
     return prefs->blockSize;
 }
 
+/* chunkSizeID : valid values : 0-1-2-3 */
+size_t LZ4IO_setChunkSizeID(LZ4IO_prefs_t* const prefs, unsigned csid)
+{
+    static const size_t chunkSizeTable[] = { 16 MB, 32 MB, 64 MB, 128 MB };
+    static const unsigned minChunkSizeID = 0;
+    static const unsigned maxChunkSizeID = 3;
+    if ((csid < minChunkSizeID) || (csid > maxChunkSizeID)) return 0;
+    prefs->chunkSizeId = (int)csid;
+    prefs->chunkSize = chunkSizeTable[(unsigned)prefs->chunkSizeId];
+    return prefs->chunkSize;
+}
+
 size_t LZ4IO_setBlockSize(LZ4IO_prefs_t* const prefs, size_t blockSize)
 {
     static const size_t minBlockSize = 32;
@@ -240,6 +259,22 @@ size_t LZ4IO_setBlockSize(LZ4IO_prefs_t* const prefs, size_t blockSize)
     if (bsid < 7) bsid = 7;
     prefs->blockSizeId = (int)(bsid-3);
     return prefs->blockSize;
+}
+
+size_t LZ4IO_setChunkSize(LZ4IO_prefs_t* const prefs, size_t chunkSize)
+{
+    static const size_t minChunkSize = 32 MB;
+    static const size_t maxChunkSize = 256 MB;
+    unsigned csid = 0;
+    if (chunkSize < minChunkSize) chunkSize = minChunkSize;
+    if (chunkSize > maxChunkSize) chunkSize = maxChunkSize;
+    prefs->chunkSize = chunkSize;
+    chunkSize--;
+    /* find which of { 32MB, 64MB, 128MB, 256MB } is closest to chunkSize */
+    while (chunkSize >>= 1)
+        csid++;
+    prefs->chunkSizeId = (int)(csid);
+    return prefs->chunkSize;
 }
 
 /* Default setting : 1 == independent blocks */
@@ -295,6 +330,11 @@ void LZ4IO_setRemoveSrcFile(LZ4IO_prefs_t* const prefs, unsigned flag)
   prefs->removeSrcFile = (flag>0);
 }
 
+int LZ4IO_setInAccel(LZ4IO_prefs_t* const prefs)
+{
+    prefs->fpgaAcceleration = 1;
+    return prefs->fpgaAcceleration;
+}
 
 
 /* ************************************************************************ **
@@ -393,11 +433,176 @@ static int LZ4IO_LZ4_compress(const char* src, char* dst, int srcSize, int dstSi
     return LZ4_compress_fast(src, dst, srcSize, dstSize, 1);
 }
 
+int LZ4IO_compressFilename_Legacy_InAccel(const char* input_filename, const char* output_filename, const LZ4IO_prefs_t* prefs)
+{
+    unsigned idx, bIdx, chunks, end = 0;
+    size_t blocksInChunk[CHUNK_PARALLELISM];
+    size_t maxBlocksPerChunk = prefs->chunkSize / (LEGACY_BLOCKSIZE);
+    unsigned long long filesize = 0, compressedfilesize = MAGICNUMBER_SIZE;
+    const unsigned outBuffSize = LZ4_compressBound(LEGACY_BLOCKSIZE);
+    char *out_buff_ref, *out_with_offset;
+    char* in_buff[CHUNK_PARALLELISM];
+    char* out_buff[CHUNK_PARALLELISM];
+    unsigned int* inBlockSize[CHUNK_PARALLELISM];
+    unsigned int* outBlockSize[CHUNK_PARALLELISM];
+    inaccel_response responses[CHUNK_PARALLELISM];
+    inaccel_request req;
+
+    FILE* const finput = LZ4IO_openSrcFile(input_filename);
+    FILE* foutput;
+    clock_t clockEnd;
+
+    /* Init */
+    clock_t const clockStart = clock();
+    if (finput == NULL)
+        EXM_THROW(20, "%s : open file error ", input_filename);
+
+    foutput = LZ4IO_openDstFile(output_filename, prefs);
+    if (foutput == NULL) {
+        fclose(finput);
+        EXM_THROW(20, "%s : open file error ", input_filename);
+    }
+
+    for(idx = 0; idx < CHUNK_PARALLELISM; ++idx) {
+        in_buff[idx] = NULL;
+        out_buff[idx] = NULL;
+        inBlockSize[idx] = NULL;
+        outBlockSize[idx] = NULL;
+    }
+
+    out_buff_ref = (char *) malloc((size_t) outBuffSize + 4);
+    if (!out_buff_ref)
+        EXM_THROW(21, "Allocation error : not enough memory");
+
+    /* Write Archive Header */
+    LZ4IO_writeLE32(out_buff_ref, LEGACY_MAGICNUMBER);
+    {   size_t const writeSize = fwrite(out_buff_ref, 1, MAGICNUMBER_SIZE, foutput);
+        if (writeSize != MAGICNUMBER_SIZE)
+            EXM_THROW(22, "Write error : cannot write header");
+    }
+
+    while (!end) {
+        for(idx = 0; idx < CHUNK_PARALLELISM; ++idx) {
+            size_t inSize;
+            if (!inBlockSize[idx]) {
+                in_buff[idx] = (char *) inaccel_alloc(prefs->chunkSize);
+                if (in_buff[idx] == NULL) EXM_THROW(21, "Allocation error : not enough memory");
+                out_buff[idx] = (char *) inaccel_alloc(prefs->chunkSize);
+                if (out_buff[idx] == NULL) EXM_THROW(21, "Allocation error : not enough memory");
+                inBlockSize[idx] = (U32 *) inaccel_alloc(maxBlocksPerChunk * sizeof(unsigned));
+                if (inBlockSize[idx]== NULL) EXM_THROW(21, "Allocation error : not enough memory");
+                outBlockSize[idx] = (U32 *) inaccel_alloc(maxBlocksPerChunk * sizeof(unsigned));
+                if (outBlockSize[idx] == NULL) EXM_THROW(21, "Allocation error : not enough memory");
+            }
+
+            inSize = fread(in_buff[idx], (size_t) 1, prefs->chunkSize, finput);
+            assert(inSize <= prefs->chunkSize);
+
+            if (inSize == 0) {
+                end = 1;
+                break;
+            } else if (inSize == prefs->chunkSize) {
+                blocksInChunk[idx] = maxBlocksPerChunk;
+                for (bIdx = 0; bIdx < blocksInChunk[idx]; bIdx++) {
+                    // first check if contents are the same to skip unsecessary FPGA mem transfers
+                    if (inBlockSize[idx][bIdx] != LEGACY_BLOCKSIZE) {
+                        inBlockSize[idx][bIdx] = LEGACY_BLOCKSIZE;
+                    }
+                }
+            } else {
+                blocksInChunk[idx] = inSize / LEGACY_BLOCKSIZE;
+                for (bIdx = 0; bIdx < blocksInChunk[idx]; bIdx++) {
+                    inBlockSize[idx][bIdx] = LEGACY_BLOCKSIZE;
+                }
+                if (inSize % LEGACY_BLOCKSIZE) {
+                    inBlockSize[idx][blocksInChunk[idx]] = inSize % LEGACY_BLOCKSIZE;
+                    blocksInChunk[idx]++;
+                }
+            }
+
+            filesize += inSize;
+            /* Create request to Compress Block */
+            req = inaccel_request_create("com.xilinx.vitis.dataCompression.lz4.compress");
+			if (!req) EXM_THROW(2, "FPGA error : cannot create request");
+            if(inaccel_request_arg_array(req, prefs->chunkSize, in_buff[idx], 0)) EXM_THROW(2, "FPGA error : cannot create argument");
+            if(inaccel_request_arg_array(req, prefs->chunkSize, out_buff[idx], 1)) EXM_THROW(2, "FPGA error : cannot create argument");
+            if(inaccel_request_arg_array(req, maxBlocksPerChunk * sizeof(unsigned int), outBlockSize[idx], 2)) EXM_THROW(2, "FPGA error : cannot create argument");
+            if(inaccel_request_arg_array(req, maxBlocksPerChunk * sizeof(unsigned int), inBlockSize[idx], 3)) EXM_THROW(2, "FPGA error : cannot create argument");
+            if(inaccel_request_arg_scalar(req, sizeof(unsigned int), &blocksInChunk[idx], 4)) EXM_THROW(2, "FPGA error : cannot create argument");
+            /* Send request to Compress Block */
+            responses[idx] = inaccel_response_create();
+			if (!responses[idx]) EXM_THROW(2, "FPGA error : cannot create response");
+            if(inaccel_submit(req, responses[idx])) EXM_THROW(2, "FPGA error : cannot submit request");
+            inaccel_request_release(req);
+        }
+
+        chunks = idx;
+        for(idx = 0; idx < chunks; ++idx) {
+            /* Wait for session completion */
+            if(inaccel_response_wait(responses[idx]))  EXM_THROW(2, "FPGA error : cannot wait on response");
+            inaccel_response_release(responses[idx]);
+
+            for(bIdx = 0; bIdx < blocksInChunk[idx]; bIdx++) {
+                /* Read compressed block size */
+                if (outBlockSize[idx][bIdx] && (outBlockSize[idx][bIdx] < inBlockSize[idx][bIdx])) {
+                    out_with_offset = out_buff[idx] + bIdx * LEGACY_BLOCKSIZE;
+                } else {
+                    outBlockSize[idx][bIdx] = LZ4IO_LZ4_compress(in_buff[idx] + bIdx * LEGACY_BLOCKSIZE, out_buff_ref + 4, inBlockSize[idx][bIdx], outBuffSize, 1);
+                    out_with_offset = out_buff_ref + 4;
+                }
+
+                compressedfilesize += outBlockSize[idx][bIdx] + 4;
+                /* Write Block */
+                assert(outBlockSize[idx][bIdx] > 0);
+                assert(outBlockSize[idx][bIdx] < outBuffSize);
+                LZ4IO_writeLE32(out_buff_ref, (unsigned)outBlockSize[idx][bIdx]);
+
+                {
+                    size_t writeSize = fwrite(out_buff_ref, 1, 4, foutput);
+                    writeSize += fwrite(out_with_offset, 1, outBlockSize[idx][bIdx], foutput);
+                    if (writeSize != (size_t)(outBlockSize[idx][bIdx] + 4))
+                    EXM_THROW(24, "Write error : cannot write compressed block");
+                }
+            }
+            DISPLAYUPDATE(2, "\rRead : %i MB    ==> %.2f%%    ",
+                (int)(filesize>>20), (double)compressedfilesize/filesize*100);
+            in_buff[idx][0] = '\0';
+        }
+    }
+
+    if (ferror(finput)) EXM_THROW(25, "Error while reading %s ", input_filename);
+
+    /* Status */
+    clockEnd = clock();
+    if (clockEnd==clockStart) clockEnd+=1;  /* avoid division by zero (speed) */
+    filesize += !filesize;    /* avoid division by zero (ratio) */
+    DISPLAYLEVEL(2, "\r%79s\r", "");    /* blank line */
+    DISPLAYLEVEL(2,"Compressed %llu bytes into %llu bytes ==> %.2f%%\n",
+        filesize, compressedfilesize, (double)compressedfilesize / filesize * 100);
+    {   double const seconds = (double)(clockEnd - clockStart) / CLOCKS_PER_SEC;
+        DISPLAYLEVEL(4,"Done in %.2f s ==> %.2f MB/s\n", seconds,
+            ((double)filesize) / seconds / 1024 / 1024);
+    }
+
+    /* Close & Free */
+    fclose(finput);
+    fclose(foutput);
+    free(out_buff_ref);
+    for(idx = 0; idx < CHUNK_PARALLELISM; ++idx) {
+        inaccel_free(in_buff[idx]);
+        inaccel_free(out_buff[idx]);
+        inaccel_free(inBlockSize[idx]);
+        inaccel_free(outBlockSize[idx]);
+    }
+
+    return 0;
+}
+
 /* LZ4IO_compressFilename_Legacy :
  * This function is intentionally "hidden" (not published in .h)
  * It generates compressed streams using the old 'legacy' format */
 int LZ4IO_compressFilename_Legacy(const char* input_filename, const char* output_filename,
-                                  int compressionlevel, const LZ4IO_prefs_t* prefs)
+                                  int compressionlevel, const LZ4IO_prefs_t*  prefs)
 {
     typedef int (*compress_f)(const char* src, char* dst, int srcSize, int dstSize, int cLevel);
     compress_f const compressionFunction = (compressionlevel < 3) ? LZ4IO_LZ4_compress : LZ4_compress_HC;
@@ -408,10 +613,14 @@ int LZ4IO_compressFilename_Legacy(const char* input_filename, const char* output
     const int outBuffSize = LZ4_compressBound(LEGACY_BLOCKSIZE);
     FILE* const finput = LZ4IO_openSrcFile(input_filename);
     FILE* foutput;
-    clock_t clockEnd;
+    clock_t clockStart, clockEnd;
+
+    if (prefs->fpgaAcceleration) {
+        return LZ4IO_compressFilename_Legacy_InAccel(input_filename, output_filename, prefs);
+    }
 
     /* Init */
-    clock_t const clockStart = clock();
+    clockStart = clock();
     if (finput == NULL)
         EXM_THROW(20, "%s : open file error ", input_filename);
 
@@ -612,19 +821,30 @@ static LZ4F_CDict* LZ4IO_createCDict(const LZ4IO_prefs_t* const prefs)
 static cRess_t LZ4IO_createCResources(const LZ4IO_prefs_t* const prefs)
 {
     const size_t blockSize = prefs->blockSize;
+    const size_t chunkSize = prefs->chunkSize;
     cRess_t ress;
 
     LZ4F_errorCode_t const errorCode = LZ4F_createCompressionContext(&(ress.ctx), LZ4F_VERSION);
     if (LZ4F_isError(errorCode)) EXM_THROW(30, "Allocation error : can't create LZ4F context : %s", LZ4F_getErrorName(errorCode));
 
     /* Allocate Memory */
-    ress.srcBuffer = malloc(blockSize);
-    ress.srcBufferSize = blockSize;
-    ress.dstBufferSize = LZ4F_compressFrameBound(blockSize, NULL);   /* cover worst case */
-    ress.dstBuffer = malloc(ress.dstBufferSize);
-    if (!ress.srcBuffer || !ress.dstBuffer) EXM_THROW(31, "Allocation error : not enough memory");
+    if (prefs->fpgaAcceleration) {
+        ress.srcBuffer = malloc(CHUNK_PARALLELISM * chunkSize);
+        ress.srcBufferSize = CHUNK_PARALLELISM * chunkSize;
+        ress.dstBufferSize = LZ4F_compressFrameBound(CHUNK_PARALLELISM * chunkSize, NULL);   /* cover worst case */
+        ress.dstBuffer = malloc(ress.dstBufferSize);
+        if (!ress.srcBuffer || !ress.dstBuffer) EXM_THROW(31, "Allocation error : not enough memory");
 
-    ress.cdict = LZ4IO_createCDict(prefs);
+        ress.cdict = 0;
+    } else {
+        ress.srcBuffer = malloc(blockSize);
+        ress.srcBufferSize = blockSize;
+        ress.dstBufferSize = LZ4F_compressFrameBound(blockSize, NULL);   /* cover worst case */
+        ress.dstBuffer = malloc(ress.dstBufferSize);
+        if (!ress.srcBuffer || !ress.dstBuffer) EXM_THROW(31, "Allocation error : not enough memory");
+
+        ress.cdict = LZ4IO_createCDict(prefs);
+    }
 
     return ress;
 }
@@ -634,8 +854,10 @@ static void LZ4IO_freeCResources(cRess_t ress)
     free(ress.srcBuffer);
     free(ress.dstBuffer);
 
-    LZ4F_freeCDict(ress.cdict);
-    ress.cdict = NULL;
+    if (ress.cdict) {
+        LZ4F_freeCDict(ress.cdict);
+        ress.cdict = NULL;
+    }
 
     { LZ4F_errorCode_t const errorCode = LZ4F_freeCompressionContext(ress.ctx);
       if (LZ4F_isError(errorCode)) EXM_THROW(38, "Error : can't free LZ4F context resource : %s", LZ4F_getErrorName(errorCode)); }
@@ -659,6 +881,7 @@ LZ4IO_compressFilename_extRess(cRess_t ress,
     const size_t dstBufferSize = ress.dstBufferSize;
     const size_t blockSize = io_prefs->blockSize;
     size_t readSize;
+    size_t compressReadSize;
     LZ4F_compressionContext_t ctx = ress.ctx;   /* just a pointer */
     LZ4F_preferences_t prefs;
 
@@ -677,6 +900,8 @@ LZ4IO_compressFilename_extRess(cRess_t ress,
     prefs.frameInfo.blockChecksumFlag = (LZ4F_blockChecksum_t)io_prefs->blockChecksum;
     prefs.frameInfo.contentChecksumFlag = (LZ4F_contentChecksum_t)io_prefs->streamChecksum;
     prefs.favorDecSpeed = io_prefs->favorDecSpeed;
+    prefs.fpgaAcceleration = io_prefs->fpgaAcceleration;
+    prefs.frameInfo.chunkSizeID = io_prefs->chunkSizeId;
     if (io_prefs->contentSizeFlag) {
       U64 const fileSize = UTIL_getOpenFileSize(srcFile);
       prefs.frameInfo.contentSize = fileSize;   /* == 0 if input == stdin */
@@ -684,13 +909,19 @@ LZ4IO_compressFilename_extRess(cRess_t ress,
           DISPLAYLEVEL(3, "Warning : cannot determine input content size \n");
     }
 
+    if (io_prefs->fpgaAcceleration){
+        compressReadSize = CHUNK_PARALLELISM * io_prefs->chunkSize;
+    } else {
+        compressReadSize = blockSize;
+    }
+
     /* read first block */
-    readSize  = fread(srcBuffer, (size_t)1, blockSize, srcFile);
+    readSize  = fread(srcBuffer, (size_t)1, compressReadSize, srcFile);
     if (ferror(srcFile)) EXM_THROW(30, "Error reading %s ", srcFileName);
     filesize += readSize;
 
     /* single-block file */
-    if (readSize < blockSize) {
+    if (readSize < compressReadSize) {
         /* Compress in single pass */
         size_t const cSize = LZ4F_compressFrame_usingCDict(ctx, dstBuffer, dstBufferSize, srcBuffer, readSize, ress.cdict, &prefs);
         if (LZ4F_isError(cSize))
@@ -729,7 +960,7 @@ LZ4IO_compressFilename_extRess(cRess_t ress,
                 EXM_THROW(36, "Write error : cannot write compressed block");
 
             /* Read next block */
-            readSize  = fread(srcBuffer, (size_t)1, (size_t)blockSize, srcFile);
+            readSize  = fread(srcBuffer, (size_t)1, (size_t)compressReadSize, srcFile);
             filesize += readSize;
         }
         if (ferror(srcFile)) EXM_THROW(37, "Error reading %s ", srcFileName);
@@ -1117,7 +1348,7 @@ LZ4IO_passThrough(FILE* finput, FILE* foutput,
                   unsigned char MNstore[MAGICNUMBER_SIZE],
                   int sparseFileSupport)
 {
-	size_t buffer[PTSIZET];
+    size_t buffer[PTSIZET];
     size_t readBytes = 1;
     unsigned long long total = MAGICNUMBER_SIZE;
     unsigned storedSkips = 0;
