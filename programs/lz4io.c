@@ -126,7 +126,7 @@ struct LZ4IO_prefs_s {
     unsigned favorDecSpeed;
     const char* dictionaryFilename;
     int removeSrcFile;
-    unsigned fpgaAcceleration;
+    unsigned mode;
     int chunkSizeId;
     size_t chunkSize;
 };
@@ -179,7 +179,7 @@ LZ4IO_prefs_t* LZ4IO_defaultPreferences(void)
     ret->favorDecSpeed = 0;
     ret->dictionaryFilename = NULL;
     ret->removeSrcFile = 0;
-    ret->fpgaAcceleration = 0;
+    ret->mode = 1;
     ret->chunkSizeId = 1;
     ret->chunkSize = 0;
     return ret;
@@ -332,8 +332,8 @@ void LZ4IO_setRemoveSrcFile(LZ4IO_prefs_t* const prefs, unsigned flag)
 
 int LZ4IO_setInAccel(LZ4IO_prefs_t* const prefs)
 {
-    prefs->fpgaAcceleration = 1;
-    return prefs->fpgaAcceleration;
+    prefs->mode = 0;
+    return prefs->mode;
 }
 
 
@@ -523,7 +523,7 @@ int LZ4IO_compressFilename_Legacy_InAccel(const char* input_filename, const char
             filesize += inSize;
             /* Create request to Compress Block */
             req = inaccel_request_create("com.xilinx.vitis.dataCompression.lz4.compress");
-			if (!req) EXM_THROW(2, "FPGA error : cannot create request");
+            if (!req) EXM_THROW(2, "FPGA error : cannot create request");
             if(inaccel_request_arg_array(req, prefs->chunkSize, in_buff[idx], 0)) EXM_THROW(2, "FPGA error : cannot create argument");
             if(inaccel_request_arg_array(req, prefs->chunkSize, out_buff[idx], 1)) EXM_THROW(2, "FPGA error : cannot create argument");
             if(inaccel_request_arg_array(req, maxBlocksPerChunk * sizeof(unsigned int), outBlockSize[idx], 2)) EXM_THROW(2, "FPGA error : cannot create argument");
@@ -531,7 +531,7 @@ int LZ4IO_compressFilename_Legacy_InAccel(const char* input_filename, const char
             if(inaccel_request_arg_scalar(req, sizeof(unsigned int), &blocksInChunk[idx], 4)) EXM_THROW(2, "FPGA error : cannot create argument");
             /* Send request to Compress Block */
             responses[idx] = inaccel_response_create();
-			if (!responses[idx]) EXM_THROW(2, "FPGA error : cannot create response");
+            if (!responses[idx]) EXM_THROW(2, "FPGA error : cannot create response");
             if(inaccel_submit(req, responses[idx])) EXM_THROW(2, "FPGA error : cannot submit request");
             inaccel_request_release(req);
         }
@@ -615,7 +615,7 @@ int LZ4IO_compressFilename_Legacy(const char* input_filename, const char* output
     FILE* foutput;
     clock_t clockStart, clockEnd;
 
-    if (prefs->fpgaAcceleration) {
+    if (!prefs->mode) {
         return LZ4IO_compressFilename_Legacy_InAccel(input_filename, output_filename, prefs);
     }
 
@@ -828,15 +828,7 @@ static cRess_t LZ4IO_createCResources(const LZ4IO_prefs_t* const prefs)
     if (LZ4F_isError(errorCode)) EXM_THROW(30, "Allocation error : can't create LZ4F context : %s", LZ4F_getErrorName(errorCode));
 
     /* Allocate Memory */
-    if (prefs->fpgaAcceleration) {
-        ress.srcBuffer = malloc(CHUNK_PARALLELISM * chunkSize);
-        ress.srcBufferSize = CHUNK_PARALLELISM * chunkSize;
-        ress.dstBufferSize = LZ4F_compressFrameBound(CHUNK_PARALLELISM * chunkSize, NULL);   /* cover worst case */
-        ress.dstBuffer = malloc(ress.dstBufferSize);
-        if (!ress.srcBuffer || !ress.dstBuffer) EXM_THROW(31, "Allocation error : not enough memory");
-
-        ress.cdict = 0;
-    } else {
+    if (prefs->mode) {
         ress.srcBuffer = malloc(blockSize);
         ress.srcBufferSize = blockSize;
         ress.dstBufferSize = LZ4F_compressFrameBound(blockSize, NULL);   /* cover worst case */
@@ -844,6 +836,14 @@ static cRess_t LZ4IO_createCResources(const LZ4IO_prefs_t* const prefs)
         if (!ress.srcBuffer || !ress.dstBuffer) EXM_THROW(31, "Allocation error : not enough memory");
 
         ress.cdict = LZ4IO_createCDict(prefs);
+    } else {
+        ress.srcBuffer = malloc(CHUNK_PARALLELISM * chunkSize);
+        ress.srcBufferSize = CHUNK_PARALLELISM * chunkSize;
+        ress.dstBufferSize = LZ4F_compressFrameBound(CHUNK_PARALLELISM * chunkSize, NULL);   /* cover worst case */
+        ress.dstBuffer = malloc(ress.dstBufferSize);
+        if (!ress.srcBuffer || !ress.dstBuffer) EXM_THROW(31, "Allocation error : not enough memory");
+
+        ress.cdict = 0;
     }
 
     return ress;
@@ -900,7 +900,7 @@ LZ4IO_compressFilename_extRess(cRess_t ress,
     prefs.frameInfo.blockChecksumFlag = (LZ4F_blockChecksum_t)io_prefs->blockChecksum;
     prefs.frameInfo.contentChecksumFlag = (LZ4F_contentChecksum_t)io_prefs->streamChecksum;
     prefs.favorDecSpeed = io_prefs->favorDecSpeed;
-    prefs.fpgaAcceleration = io_prefs->fpgaAcceleration;
+    prefs.mode = io_prefs->mode;
     prefs.frameInfo.chunkSizeID = io_prefs->chunkSizeId;
     if (io_prefs->contentSizeFlag) {
       U64 const fileSize = UTIL_getOpenFileSize(srcFile);
@@ -909,10 +909,10 @@ LZ4IO_compressFilename_extRess(cRess_t ress,
           DISPLAYLEVEL(3, "Warning : cannot determine input content size \n");
     }
 
-    if (io_prefs->fpgaAcceleration){
-        compressReadSize = CHUNK_PARALLELISM * io_prefs->chunkSize;
-    } else {
+    if (io_prefs->mode){
         compressReadSize = blockSize;
+    } else {
+        compressReadSize = CHUNK_PARALLELISM * io_prefs->chunkSize;
     }
 
     /* read first block */

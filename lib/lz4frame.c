@@ -664,7 +664,7 @@ size_t LZ4F_compressBegin_usingCDict(LZ4F_cctx* cctxPtr,
         cctxPtr->prefs.frameInfo.blockSizeID = LZ4F_BLOCKSIZEID_DEFAULT;
     cctxPtr->maxBlockSize = LZ4F_getBlockSize(cctxPtr->prefs.frameInfo.blockSizeID);
 
-    if (cctxPtr->prefs.fpgaAcceleration) {
+    if (!cctxPtr->prefs.mode) {
         cctxPtr->prefs.frameInfo.blockMode = LZ4F_blockIndependent;
 
         /* Initialize FPGA Buffers */
@@ -672,7 +672,7 @@ size_t LZ4F_compressBegin_usingCDict(LZ4F_cctx* cctxPtr,
         cctxPtr->fpgaPtr->maxChunkSize = LZ4F_getChunkSize(cctxPtr->prefs.frameInfo.chunkSizeID);
         cctxPtr->fpgaPtr->maxBlocksPerChunk = cctxPtr->fpgaPtr->maxChunkSize / cctxPtr->maxBlockSize;
     }
-    {   size_t buffSize = cctxPtr->prefs.fpgaAcceleration ? cctxPtr->fpgaPtr->maxChunkSize : cctxPtr->maxBlockSize;
+    {   size_t buffSize = cctxPtr->prefs.mode ? cctxPtr->maxBlockSize : cctxPtr->fpgaPtr->maxChunkSize;
         size_t const requiredBuffSize = preferencesPtr->autoFlush ?
                 ((cctxPtr->prefs.frameInfo.blockMode == LZ4F_blockLinked) ? 64 KB : 0) :  /* only needs past data up to window size */
                 buffSize + ((cctxPtr->prefs.frameInfo.blockMode == LZ4F_blockLinked) ? 128 KB : 0);
@@ -1079,7 +1079,7 @@ size_t LZ4F_compressUpdate(LZ4F_cctx* cctxPtr,
     LZ4F_lastBlockStatus lastBlockCompressed = notDone;
     compressFunc_t const compress = LZ4F_selectCompression(cctxPtr->prefs.frameInfo.blockMode, cctxPtr->prefs.compressionLevel);
 
-    if (cctxPtr->prefs.fpgaAcceleration) {
+    if (!cctxPtr->prefs.mode) {
         return LZ4F_compressUpdate_inaccel(cctxPtr, dstBuffer,dstCapacity, srcBuffer, srcSize, compressOptionsPtr);
     }
 
@@ -1222,7 +1222,7 @@ size_t LZ4F_flush(LZ4F_cctx* cctxPtr,
     BYTE* dstPtr = dstStart;
     compressFunc_t compress;
 
-    if (cctxPtr->prefs.fpgaAcceleration) {
+    if (!cctxPtr->prefs.mode) {
         size_t ret = LZ4F_flush_inaccel(cctxPtr, dstBuffer,dstCapacity, compressOptionsPtr);
         if (!LZ4F_isError(ret)) return ret;
     }
@@ -1303,7 +1303,7 @@ size_t LZ4F_compressEnd(LZ4F_cctx* cctxPtr,
             return err0r(LZ4F_ERROR_frameSize_wrong);
     }
 
-    if (cctxPtr->prefs.fpgaAcceleration) {
+    if (!cctxPtr->prefs.mode) {
         /* Destroy (free) FPGA Buffers */
         for (idx = 0; idx < CHUNK_PARALLELISM; idx++) {
             inaccel_free(cctxPtr->fpgaPtr->in[idx]);

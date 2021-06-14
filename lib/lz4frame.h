@@ -210,7 +210,7 @@ typedef struct {
   unsigned autoFlush;           /* 1: always flush; reduces usage of internal buffers */
   unsigned favorDecSpeed;       /* 1: parser favors decompression speed vs compression ratio. Only works for high compression modes (>= LZ4HC_CLEVEL_OPT_MIN) */  /* v1.8.2+ */
   unsigned reserved[3];         /* must be zero for forward compatibility */
-  int      fpgaAcceleration;    /* 0: default (disabled); 1: FPGA acceleration enabled */
+  int      mode;                /* 0: default (FPGA); 1: CPU */
 } LZ4F_preferences_t;
 
 #define LZ4F_INIT_PREFERENCES   { LZ4F_INIT_FRAMEINFO, 0, 0u, 0u, { 0u, 0u, 0u }, 0 }    /* v1.8.3+ */
