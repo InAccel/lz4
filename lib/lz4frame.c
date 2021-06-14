@@ -354,8 +354,10 @@ static size_t LZ4F_compressBound_internal(size_t srcSize,
     {   const LZ4F_preferences_t* const prefsPtr = (preferencesPtr==NULL) ? &prefsNull : preferencesPtr;
         U32 const flush = prefsPtr->autoFlush | (srcSize==0);
         LZ4F_blockSizeID_t const blockID = prefsPtr->frameInfo.blockSizeID;
+        LZ4F_chunkSizeID_t const chunkID = prefsPtr->frameInfo.chunkSizeID;
         size_t const blockSize = LZ4F_getBlockSize(blockID);
-        size_t const maxBuffered = blockSize - 1;
+        size_t const chunkSize = LZ4F_getChunkSize(chunkID);
+        size_t const maxBuffered = prefsPtr->mode ? blockSize - 1 : (srcSize ? blockSize - 1 : chunkSize - 1);
         size_t const bufferedSize = MIN(alreadyBuffered, maxBuffered);
         size_t const maxSrcSize = srcSize + bufferedSize;
         unsigned const nbFullBlocks = (unsigned)(maxSrcSize / blockSize);
@@ -1038,8 +1040,9 @@ size_t LZ4F_compressUpdate_inaccel(LZ4F_cctx* cctxPtr,
         }
 
         for (idx = 0; idx < chunk; idx++) {
-            dstPtr += LZ4F_waitChunk(dstPtr, idx, cctxPtr->fpgaPtr, blockSize, cctxPtr->prefs.frameInfo.blockChecksumFlag);
+            ret = LZ4F_waitChunk(dstPtr, idx, cctxPtr->fpgaPtr, blockSize, cctxPtr->prefs.frameInfo.blockChecksumFlag);
             if (LZ4F_isError(ret)) return ret;
+            dstPtr += ret;
         }
     }
 
