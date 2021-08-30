@@ -163,7 +163,7 @@ static int usage_advanced(const char* exeName)
         DISPLAY( " -y     : overwrite output without prompting \n");
     }
     DISPLAY( " -FC#   : set chunk size to a predefined size [0-3] (default: 1) \n");
-    DISPLAY( "                     0: 32MB, 1: 64MB, 2: 128MB, 3: 256MB \n");
+    DISPLAY( "                     0: 16MB, 1: 32MB, 2: 64MB, 3: 128MB \n");
     return 0;
 }
 
